@@ -4,3 +4,4 @@ plots/*
 *.jpg
 *.png
 *.zip
+*.pyc
