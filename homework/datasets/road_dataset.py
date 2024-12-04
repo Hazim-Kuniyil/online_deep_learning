@@ -1,14 +1,10 @@
-# homework/datasets/road_dataset.py
-
 from pathlib import Path
 
 import numpy as np
-import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 from . import road_transforms
 from .road_utils import Track
-from .road_transforms import Normalize  # Import the Normalize transform
 
 
 class RoadDataset(Dataset):
@@ -20,9 +16,6 @@ class RoadDataset(Dataset):
         self,
         episode_path: str,
         transform_pipeline: str = "default",
-        normalize: bool = False,
-        mean: np.ndarray = None,
-        std: np.ndarray = None,
     ):
         super().__init__()
 
@@ -32,9 +25,9 @@ class RoadDataset(Dataset):
 
         self.track = Track(**info["track"].item())
         self.frames: dict[str, np.ndarray] = {k: np.stack(v) for k, v in info["frames"].item().items()}
-        self.transform = self.get_transform(transform_pipeline, normalize, mean, std)
+        self.transform = self.get_transform(transform_pipeline)
 
-    def get_transform(self, transform_pipeline: str, normalize: bool, mean: np.ndarray, std: np.ndarray):
+    def get_transform(self, transform_pipeline: str):
         """
         Creates a pipeline for processing data.
 
@@ -56,21 +49,10 @@ class RoadDataset(Dataset):
             # track_left, track_right, waypoints, waypoints_mask
             xform = road_transforms.EgoTrackProcessor(self.track)
         elif transform_pipeline == "aug":
-            # Add data augmentations and normalization
-            if mean is None or std is None:
-                raise ValueError("Mean and std must be provided for 'aug' transform pipeline.")
+            # add your custom augmentations here
+            pass
 
-            xform = road_transforms.Compose(
-                [
-                    road_transforms.ImageLoader(self.episode_path),
-                    road_transforms.EgoTrackProcessor(self.track),
-                    # road_transforms.RandomHorizontalFlip(p=0.5),
-                    # road_transforms.RandomScaling(scale_range=(0.9, 1.1)),
-                    # road_transforms.RandomRotation(angle_range=(-10, 10)),
-                    Normalize(mean=mean, std=std),
-                ]
-            )
-        else:
+        if xform is None:
             raise ValueError(f"Invalid transform {transform_pipeline} specified!")
 
         return xform
@@ -97,9 +79,6 @@ def load_data(
     num_workers: int = 2,
     batch_size: int = 32,
     shuffle: bool = False,
-    normalize: bool = False,
-    mean: np.ndarray = None,
-    std: np.ndarray = None,
 ) -> DataLoader | Dataset:
     """
     Constructs the dataset/dataloader.
@@ -111,9 +90,6 @@ def load_data(
         num_workers (int): data workers, set to 0 for VSCode debugging
         batch_size (int): batch size
         shuffle (bool): should be true for train and false for val
-        normalize (bool): whether to apply normalization (only relevant for 'aug' pipeline)
-        mean (np.ndarray): mean for normalization
-        std (np.ndarray): std for normalization
 
     Returns:
         DataLoader or Dataset
@@ -127,21 +103,7 @@ def load_data(
 
     datasets = []
     for episode_path in sorted(scenes):
-        if transform_pipeline == "aug":
-            if mean is None or std is None:
-                raise ValueError("Mean and std must be provided for 'aug' transform pipeline.")
-            datasets.append(RoadDataset(
-                episode_path,
-                transform_pipeline=transform_pipeline,
-                normalize=normalize,
-                mean=mean,
-                std=std,
-            ))
-        else:
-            datasets.append(RoadDataset(
-                episode_path,
-                transform_pipeline=transform_pipeline
-            ))
+        datasets.append(RoadDataset(episode_path, transform_pipeline=transform_pipeline))
     dataset = ConcatDataset(datasets)
 
     print(f"Loaded {len(dataset)} samples from {len(datasets)} episodes")

@@ -8,6 +8,11 @@ INPUT_MEAN = [0.2788, 0.2657, 0.2629]
 INPUT_STD = [0.2064, 0.1944, 0.2252]
 
 
+# models.py
+
+import torch
+import torch.nn as nn
+
 class MLPPlanner(nn.Module):
     def __init__(
         self,
@@ -76,43 +81,48 @@ class MLPPlanner(nn.Module):
 class TransformerPlanner(nn.Module):
     def __init__(
         self,
-        n_track: int = 10,          # Number of track points on each side
-        n_waypoints: int = 3,       # Number of waypoints to predict
-        d_model: int = 64,          # Dimension of latent embeddings
-        num_heads: int = 16,         # Number of attention heads
-        num_blocks: int = 6,        # Number of Perceiver blocks
-        dim_feedforward: int = 256, # Dimension of feedforward network in SelfAttention
-        dropout: float = 0.1,       # Dropout rate
+        n_track: int = 10,
+        n_waypoints: int = 3,
+        d_model: int = 64,
+        nhead: int = 8,
+        num_layers: int = 3,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
     ):
         """
-        Initializes the PerceiverPlanner.
-    
         Args:
-            n_track (int): Number of track points on each side (left and right).
+            n_track (int): Number of points in each side of the track.
             n_waypoints (int): Number of waypoints to predict.
-            d_model (int): Dimension of latent embeddings.
-            num_heads (int): Number of attention heads.
-            num_blocks (int): Number of Perceiver blocks.
-            dim_feedforward (int): Dimension of the feedforward network.
+            d_model (int): Dimension of the model embeddings.
+            nhead (int): Number of attention heads.
+            num_layers (int): Number of transformer decoder layers.
+            dim_feedforward (int): Dimension of the feedforward network in the transformer.
             dropout (float): Dropout rate.
         """
-        super(TransformerPlanner, self).__init__()
+        super().__init__()
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
         self.d_model = d_model
 
-        input_dim = 2  # Each lane point has 2D coordinates
+        # Input projection for lane boundary points
+        self.input_proj = nn.Linear(2, d_model)
 
-        # Initialize Perceiver model
-        self.perceiver = Perceiver(
-            input_dim=input_dim,
-            latent_dim=d_model,
-            num_latents=n_waypoints,
-            num_blocks=num_blocks,
-            num_heads=num_heads,
-            output_dim=2,  # Output is 2D waypoints
+        # Learnable query embeddings for waypoints
+        self.query_embed = nn.Embedding(n_waypoints, d_model)
+
+        # Transformer Decoder
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation='relu'
         )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+
+        # Output projection to 2D coordinates
+        self.output_proj = nn.Linear(d_model, 2)
 
     def forward(
         self,
@@ -122,28 +132,44 @@ class TransformerPlanner(nn.Module):
     ) -> torch.Tensor:
         """
         Predicts waypoints from the left and right boundaries of the track.
-    
-        Args:
-            track_left (torch.Tensor): shape (batch_size, n_track, 2)
-            track_right (torch.Tensor): shape (batch_size, n_track, 2)
-    
-        Returns:
-            torch.Tensor: future waypoints with shape (batch_size, n_waypoints, 2)
-        """
-        batch_size = track_left.size(0)
 
-        # 1. Concatenate Left and Right Tracks
-        # Shape: (batch_size, 2 * n_track, 2)
-        track = torch.cat([track_left, track_right], dim=1)
-        # print(f"{torch.std_mean(track) = }")
-        # 2. Pass through Perceiver
-        # Output shape: (batch_size, n_waypoints, 2)
-        waypoints = self.perceiver(track)
-        # print(f"{torch.std_mean(waypoints) = }")
+        Args:
+            track_left (torch.Tensor): shape (B, n_track, 2)
+            track_right (torch.Tensor): shape (B, n_track, 2)
+
+        Returns:
+            torch.Tensor: Future waypoints with shape (B, n_waypoints, 2)
+        """
+        B = track_left.size(0)
+
+        # Concatenate left and right tracks: (B, n_track*2, 2)
+        track_combined = torch.cat([track_left, track_right], dim=1)  # (B, 20, 2)
+
+        # Project input points to d_model
+        # (B, n_track*2, d_model)
+        track_embedded = self.input_proj(track_combined)
+
+        # Prepare memory for transformer: shape (n_track*2, B, d_model)
+        memory = track_embedded.permute(1, 0, 2)  # (S, B, E)
+
+        # Prepare query embeddings
+        # (n_waypoints, B, d_model)
+        query_embeddings = self.query_embed.weight  # (n_waypoints, d_model)
+        query_embeddings = query_embeddings.unsqueeze(1).repeat(1, B, 1)  # (n_waypoints, B, d_model)
+
+        # Transformer expects tgt to be (T, B, E)
+        decoded = self.transformer_decoder(tgt=query_embeddings, memory=memory)  # (n_waypoints, B, d_model)
+
+        # Permute to (B, n_waypoints, d_model)
+        decoded = decoded.permute(1, 0, 2)  # (B, n_waypoints, d_model)
+
+        # Project to 2D coordinates
+        waypoints = self.output_proj(decoded)  # (B, n_waypoints, 2)
+
         return waypoints
 
 
-class CNNPlanner(torch.nn.Module):
+class CNNPlanner(nn.Module):
     def __init__(
         self,
         n_waypoints: int = 3,
@@ -155,18 +181,63 @@ class CNNPlanner(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
 
+        # Define CNN architecture
+        # Example architecture: Conv -> ReLU -> Pool -> Conv -> ReLU -> Pool -> Flatten -> FC -> ReLU -> FC
+        # Final output layer has n_waypoints * 2 neurons
+
+        self.conv_layers = nn.Sequential(
+            # First convolutional block
+            nn.Conv2d(in_channels=3, out_channels=16, kernel_size=5, stride=2, padding=2),  # (B, 16, 48, 64)
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # (B, 16, 24, 32)
+
+            # Second convolutional block
+            nn.Conv2d(in_channels=16, out_channels=32, kernel_size=3, stride=2, padding=1),  # (B, 32, 12, 16)
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),  # (B, 32, 6, 8)
+
+            # Third convolutional block
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),  # (B, 64, 3, 4)
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),  # (B, 64, 1, 1)
+        )
+
+        # Fully connected layers
+        self.fc_layers = nn.Sequential(
+            nn.Flatten(),  # (B, 64)
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, n_waypoints * 2),  # Output: (B, n_waypoints * 2)
+        )
+
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
         """
+        Predicts waypoints from image input.
+
         Args:
-            image (torch.FloatTensor): shape (b, 3, h, w) and vals in [0, 1]
+            image (torch.FloatTensor): shape (B, 3, 96, 128) and values in [0, 1]
 
         Returns:
-            torch.FloatTensor: future waypoints with shape (b, n, 2)
+            torch.FloatTensor: future waypoints with shape (B, n_waypoints, 2)
         """
+        # Normalize the image
+        # Shape: (B, 3, 96, 128)
         x = image
         x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        raise NotImplementedError
+        # Pass through CNN
+        x = self.conv_layers(x)  # Shape: (B, 64, 1, 1)
+
+        # Pass through fully connected layers
+        x = self.fc_layers(x)  # Shape: (B, n_waypoints * 2)
+
+        # Reshape to (B, n_waypoints, 2)
+        waypoints = x.view(-1, self.n_waypoints, 2)
+
+        return waypoints
 
 
 MODEL_FACTORY = {
@@ -230,185 +301,3 @@ def calculate_model_size_mb(model: torch.nn.Module) -> float:
     Naive way to estimate model size
     """
     return sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024
-
-# ======================================================================
-#                           Perciever Components
-# ======================================================================
-
-# homework/models.py
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-
-class CrossAttention(nn.Module):
-    def __init__(self, latent_dim, input_dim, num_heads, dropout=0.1):
-        """
-        Cross-Attention module where latents attend to input features with LayerNorm.
-    
-        Args:
-            latent_dim (int): Dimension of latent embeddings.
-            input_dim (int): Dimension of input features.
-            num_heads (int): Number of attention heads.
-            dropout (float): Dropout rate.
-        """
-        super(CrossAttention, self).__init__()
-        self.latent_dim = latent_dim
-        self.input_dim = input_dim
-        self.num_heads = num_heads
-        self.dropout = dropout
-        
-        self.attention = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=num_heads, dropout=dropout, batch_first=True)
-        self.to_latent = nn.Linear(input_dim, latent_dim)
-        
-        # LayerNorm for Cross-Attention
-        self.norm = nn.LayerNorm(latent_dim)
-        self.dropout_layer = nn.Dropout(dropout)
-
-    def forward(self, latents, inputs, input_mask=None):
-        """
-        Forward pass for Cross-Attention with residual connection and LayerNorm.
-    
-        Args:
-            latents (torch.Tensor): Latent embeddings, shape (batch_size, num_latents, latent_dim)
-            inputs (torch.Tensor): Input features, shape (batch_size, input_seq_len, input_dim)
-            input_mask (torch.Tensor, optional): Mask for input features, shape (batch_size, input_seq_len)
-    
-        Returns:
-            torch.Tensor: Updated latents after cross-attention, shape (batch_size, num_latents, latent_dim)
-        """
-        # Project inputs to latent dimension
-        inputs_proj = self.to_latent(inputs)  # Shape: (batch_size, input_seq_len, latent_dim)
-    
-        # Perform cross-attention: queries=latents, keys=values=inputs_proj
-        attn_output, attn_weights = self.attention(query=latents, key=inputs_proj, value=inputs_proj, key_padding_mask=input_mask)
-    
-        # Apply Dropout
-        attn_output = self.dropout_layer(attn_output)
-    
-        # Residual Connection and LayerNorm
-        latents = self.norm(latents + attn_output)  # Shape: (batch_size, num_latents, latent_dim)
-    
-        return latents
-    
-
-class SelfAttention(nn.Module):
-    def __init__(self, latent_dim, num_heads, dropout=0.1):
-        """
-        Self-Attention module for processing latents.
-
-        Args:
-            latent_dim (int): Dimension of latent embeddings.
-            num_heads (int): Number of attention heads.
-            dropout (float): Dropout rate.
-        """
-        super(SelfAttention, self).__init__()
-        self.self_attn = nn.MultiheadAttention(embed_dim=latent_dim, num_heads=num_heads, batch_first=True)
-        self.linear1 = nn.Linear(latent_dim, latent_dim * 4)
-        self.linear2 = nn.Linear(latent_dim * 4, latent_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.norm1 = nn.LayerNorm(latent_dim)
-        self.norm2 = nn.LayerNorm(latent_dim)
-        self.activation = F.relu
-
-    def forward(self, x):
-        """
-        Forward pass for Self-Attention.
-
-        Args:
-            x (torch.Tensor): Latent embeddings, shape (batch_size, num_latents, latent_dim)
-
-        Returns:
-            torch.Tensor: Updated latents after self-attention, shape (batch_size, num_latents, latent_dim)
-        """
-        # Self-attention
-        attn_output, _ = self.self_attn(x, x, x)
-        x = self.norm1(x + attn_output)
-
-        # Feed-forward network
-        ff_output = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = self.norm2(x + ff_output)
-
-        return x
-
-
-class PerceiverBlock(nn.Module):
-    def __init__(self, latent_dim, input_dim, num_heads, dropout=0.1):
-        """
-        A single Perceiver block consisting of cross-attention and self-attention.
-    
-        Args:
-            latent_dim (int): Dimension of latent embeddings.
-            input_dim (int): Dimension of input features.
-            num_heads (int): Number of attention heads.
-            dropout (float): Dropout rate.
-        """
-        super(PerceiverBlock, self).__init__()
-        self.cross_attn = CrossAttention(latent_dim, input_dim, num_heads, dropout)
-        self.self_attn = SelfAttention(latent_dim, num_heads, dropout)
-
-    def forward(self, latents, inputs, input_mask=None):
-        """
-        Forward pass for PerceiverBlock.
-    
-        Args:
-            latents (torch.Tensor): Latent embeddings, shape (batch_size, num_latents, latent_dim)
-            inputs (torch.Tensor): Input features, shape (batch_size, input_seq_len, input_dim)
-            input_mask (torch.Tensor, optional): Mask for input features, shape (batch_size, input_seq_len)
-    
-        Returns:
-            torch.Tensor: Updated latents after PerceiverBlock, shape (batch_size, num_latents, latent_dim)
-        """
-        latents = self.cross_attn(latents, inputs, input_mask)  # LayerNorm applied within CrossAttention
-        latents = self.self_attn(latents)  # LayerNorm applied within SelfAttention
-        return latents
-
-
-class Perceiver(nn.Module):
-    def __init__(self, 
-                 input_dim,        # Dimension of input features
-                 latent_dim,       # Dimension of latent array
-                 num_latents,      # Number of latent vectors (e.g., number of waypoints)
-                 num_blocks,       # Number of Perceiver blocks
-                 num_heads,        # Number of attention heads
-                 output_dim,       # Dimension of output features (e.g., 2 for 2D waypoints)
-                 ):
-        """
-        Perceiver model for processing input features and predicting outputs.
-
-        Args:
-            input_dim (int): Dimension of input features (e.g., 2 for 2D lane points).
-            latent_dim (int): Dimension of latent embeddings.
-            num_latents (int): Number of latent vectors (e.g., number of waypoints to predict).
-            num_blocks (int): Number of Perceiver blocks.
-            num_heads (int): Number of attention heads.
-            output_dim (int): Dimension of output features (e.g., 2 for 2D waypoints).
-        """
-        super(Perceiver, self).__init__()
-        self.latents = nn.Parameter(torch.randn(1, num_latents, latent_dim))  # Initialized latents
-        self.blocks = nn.ModuleList([
-            PerceiverBlock(latent_dim, input_dim, num_heads) for _ in range(num_blocks)
-        ])
-        self.to_output = nn.Linear(latent_dim, output_dim)  # Project latents to output features
-
-    def forward(self, inputs, input_mask=None):
-        """
-        Forward pass for Perceiver.
-
-        Args:
-            inputs (torch.Tensor): Input features, shape (batch_size, input_seq_len, input_dim)
-            input_mask (torch.Tensor, optional): Mask for input features, shape (batch_size, input_seq_len)
-
-        Returns:
-            torch.Tensor: Predicted outputs, shape (batch_size, num_latents, output_dim)
-        """
-        batch_size = inputs.size(0)
-        latents = self.latents.expand(batch_size, -1, -1)  # Shape: (batch_size, num_latents, latent_dim)
-
-        for block in self.blocks:
-            latents = block(latents, inputs, input_mask)
-
-        # Project latents to output features
-        output = self.to_output(latents)  # Shape: (batch_size, num_latents, output_dim)
-        return output

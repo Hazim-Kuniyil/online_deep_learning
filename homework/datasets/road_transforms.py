@@ -263,33 +263,3 @@ class EgoTrackProcessor:
             "waypoints": waypoints.astype(np.float32),
             "waypoints_mask": waypoints_mask,
         }
-
-
-class Normalize:
-    """
-    Normalizes the track_left and track_right inputs using the provided mean and std.
-    """
-    def __init__(self, mean: np.ndarray, std: np.ndarray):
-        """
-        Args:
-            mean (np.ndarray): Mean for each feature, shape (2,)
-            std (np.ndarray): Std for each feature, shape (2,)
-        """
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, sample: dict):
-        """
-        Normalizes the track_left and track_right in the sample.
-
-        Args:
-            sample (dict): Sample dictionary containing 'track_left' and 'track_right'.
-
-        Returns:
-            dict: Sample with normalized 'track_left' and 'track_right'.
-        """
-        if 'track_left' in sample:
-            sample['track_left'] = (sample['track_left'] - self.mean) / self.std
-        if 'track_right' in sample:
-            sample['track_right'] = (sample['track_right'] - self.mean) / self.std
-        return sample
