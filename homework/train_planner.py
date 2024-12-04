@@ -1,4 +1,4 @@
-# homework/train_planner.py
+# I used AI tools to elp me write this script
 
 import argparse
 import os
